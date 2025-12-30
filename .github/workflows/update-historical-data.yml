@@ -1,0 +1,154 @@
+name: Update Historical Data
+
+on:
+  schedule:
+    # Run every day at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@v4
+          
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - name: Install tsx
+        run: npm install -g tsx
+        
+      - name: Create update script
+        run: |
+          cat > update_data.ts << 'EOF'
+          import * as fs from 'fs';
+          
+          interface Kline {
+              time: number;
+              open: number;
+              high: number;
+              low: number;
+              close: number;
+              volume: number;
+          }
+          
+          const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
+          const MARKETS = ['spot', 'futures'];
+          const INTERVALS = ['15m', '1h', '4h', '1d', '5m'];
+          
+          async function fetchLatestKlines(
+              market: string,
+              symbol: string,
+              interval: string,
+              since: number
+          ): Promise<Kline[]> {
+              const allKlines: Kline[] = [];
+              let currentStart = since;
+              const now = Date.now();
+              
+              const baseUrl = market === 'futures' 
+                  ? 'https://fapi.binance.com/fapi/v1/klines'
+                  : 'https://api.binance.com/api/v3/klines';
+              
+              while (currentStart < now) {
+                  const url = `${baseUrl}?symbol=${symbol}&interval=${interval}&startTime=${currentStart}&limit=1000`;
+                  
+                  const response = await fetch(url);
+                  const data = await response.json();
+                  
+                  if (!Array.isArray(data) || data.length === 0) break;
+                  
+                  const klines: Kline[] = data.map((k: any[]) => ({
+                      time: k[0],
+                      open: parseFloat(k[1]),
+                      high: parseFloat(k[2]),
+                      low: parseFloat(k[3]),
+                      close: parseFloat(k[4]),
+                      volume: parseFloat(k[5])
+                  }));
+                  
+                  allKlines.push(...klines);
+                  currentStart = klines[klines.length - 1].time + 1;
+                  
+                  await new Promise(resolve => setTimeout(resolve, 500));
+              }
+              
+              return allKlines;
+          }
+          
+          async function updateFile(market: string, symbol: string, interval: string) {
+              const filename = `${market}-${symbol}-${interval}.json`;
+              
+              if (!fs.existsSync(filename)) {
+                  console.log(`⚠️  ${filename} not found, skipping`);
+                  return;
+              }
+              
+              const existingData: Kline[] = JSON.parse(fs.readFileSync(filename, 'utf-8'));
+              const lastTime = existingData[existingData.length - 1]?.time || 0;
+              
+              console.log(`📥 ${filename}: fetching since ${new Date(lastTime).toISOString()}`);
+              
+              const newKlines = await fetchLatestKlines(market, symbol, interval, lastTime + 1);
+              
+              if (newKlines.length === 0) {
+                  console.log(`✅ ${filename}: already up to date`);
+                  return;
+              }
+              
+              const allData = [...existingData, ...newKlines];
+              allData.sort((a, b) => a.time - b.time);
+              
+              const uniqueData = allData.filter((item, index, arr) => {
+                  return index === 0 || item.time !== arr[index - 1].time;
+              });
+              
+              fs.writeFileSync(filename, JSON.stringify(uniqueData, null, 0));
+              console.log(`💾 ${filename}: added ${newKlines.length} candles (total: ${uniqueData.length.toLocaleString()})`);
+          }
+          
+          async function main() {
+              console.log('🔄 Starting historical data update...\n');
+              
+              for (const market of MARKETS) {
+                  for (const symbol of SYMBOLS) {
+                      for (const interval of INTERVALS) {
+                          try {
+                              await updateFile(market, symbol, interval);
+                          } catch (error) {
+                              console.error(`❌ Failed to update ${market}-${symbol}-${interval}:`, error);
+                          }
+                      }
+                  }
+              }
+              
+              console.log('\n✅ Update complete!');
+          }
+          
+          main().catch(console.error);
+          EOF
+          
+      - name: Run update script
+        run: tsx update_data.ts
+        
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add *.json
+          git commit -m "chore: auto-update historical data $(date +'%Y-%m-%d')"
+          git push
